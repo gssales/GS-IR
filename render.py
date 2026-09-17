@@ -67,9 +67,9 @@ def render_set(
         os.makedirs(occl_path, exist_ok=True)
         os.makedirs(indir_path, exist_ok=True)
 
+    light.build_mips()
     if save_envmap:
         # build mip for environment light
-        light.build_mips()
         envmap = light.export_envmap(return_img=True).permute(2, 0, 1).clamp(min=0.0, max=1.0)
         os.makedirs(os.path.join(model_path, name), exist_ok=True)
         envmap_path = os.path.join(model_path, name, "envmap.png")
@@ -181,7 +181,7 @@ def render_set(
                     os.path.join(depths_path, f"{idx:05d}_depth.png"),
                     depth_img
                 )
-                
+
                 indirect_light = (1 - occlusion) * irradiance
                 torchvision.utils.save_image(
                     occlusion.permute(2, 0, 1), os.path.join(occl_path, f"{idx:05d}_occl.png")
