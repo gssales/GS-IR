@@ -25,62 +25,51 @@ from utils.loss_utils import ssim as get_ssim
 def render_set(
     model_path: str,
     name: str,
+    iteration: int,
+    views: list,
     scene: Scene,
     light: CubemapLight,
     irradiance_volumes: IrradianceVolumes,
     pipeline: GroupParams,
+    background, 
     occlusion_volumes: Optional[Dict] = None,
     pbr: bool = False,
     metallic: bool = False,
     tone: bool = False,
     gamma: bool = False,
     indirect: bool = False,
+    save_extra=False, 
+    save_normals=False,
+    save_envmap=False,
 ) -> None:
-    iteration = scene.loaded_iter
-    if name == "train":
-        views = scene.getTrainCameras()
-    elif name == "test":
-        views = scene.getTestCameras()
-    else:
-        raise ValueError
-
-    # build mip for environment light
-    light.build_mips()
-    envmap = light.export_envmap(return_img=True).permute(2, 0, 1).clamp(min=0.0, max=1.0)
-    os.makedirs(os.path.join(model_path, name), exist_ok=True)
-    envmap_path = os.path.join(model_path, name, "envmap.png")
-    torchvision.utils.save_image(envmap, envmap_path)
-
     render_path = os.path.join(model_path, name, f"ours_{iteration}", "renders")
     gts_path = os.path.join(model_path, name, f"ours_{iteration}", "gt")
-    depths_path = os.path.join(model_path, name, f"ours_{iteration}", "depth")
-    normals_path = os.path.join(model_path, name, f"ours_{iteration}", "normal")
-    pbr_path = os.path.join(model_path, name, f"ours_{iteration}", "pbr")
-    pc_path = os.path.join(model_path, name, f"ours_{iteration}", "pc")
-
+    
     os.makedirs(render_path, exist_ok=True)
     os.makedirs(gts_path, exist_ok=True)
-    os.makedirs(depths_path, exist_ok=True)
-    os.makedirs(normals_path, exist_ok=True)
-    os.makedirs(pbr_path, exist_ok=True)
-    os.makedirs(pc_path, exist_ok=True)
-
-    brdf_lut = get_brdf_lut().cuda()
-    canonical_rays = scene.get_canonical_rays()
-
-    ref_view = views[0]
-    H, W = ref_view.image_height, ref_view.image_width
-    c2w = torch.inverse(ref_view.world_view_transform.T)  # [4, 4]
-    view_dirs_ = (  # NOTE: no negative here
-        (canonical_rays[:, None, :] * c2w[None, :3, :3]).sum(dim=-1).reshape(H, W, 3)  # [HW, 3, 3]
-    )  # [H, W, 3]
-    norm = torch.norm(canonical_rays, p=2, dim=-1).reshape(H, W, 1)
 
 
-    psnr_avg = 0.0
-    ssim_avg = 0.0
-    lpips_avg = 0.0
-    lpips_fn = LPIPS(net="vgg").cuda()
+    if save_normals:
+        normals_path = os.path.join(model_path, name, f"ours_{iteration}", "normals")
+        os.makedirs(normals_path, exist_ok=True)
+
+    if save_extra:
+        normals_from_depth_path = os.path.join(model_path, name, f"ours_{iteration}", "normal_from_depth")
+        depths_path = os.path.join(model_path, name, f"ours_{iteration}", "depth")
+        pbr_path = os.path.join(model_path, name, f"ours_{iteration}", "pbr")
+        pc_path = os.path.join(model_path, name, f"ours_{iteration}", "pc")
+        os.makedirs(normals_from_depth_path, exist_ok=True)
+        os.makedirs(depths_path, exist_ok=True)
+        os.makedirs(pbr_path, exist_ok=True)
+        os.makedirs(pc_path, exist_ok=True)
+
+    if save_envmap:
+        # build mip for environment light
+        light.build_mips()
+        envmap = light.export_envmap(return_img=True).permute(2, 0, 1).clamp(min=0.0, max=1.0)
+        os.makedirs(os.path.join(model_path, name), exist_ok=True)
+        envmap_path = os.path.join(model_path, name, "envmap.png")
+        torchvision.utils.save_image(envmap, envmap_path)
 
     if occlusion_volumes is not None:
         occlusion_ids = occlusion_volumes["occlusion_ids"]
@@ -88,8 +77,8 @@ def render_set(
         occlusion_degree = occlusion_volumes["degree"]
         bound = occlusion_volumes["bound"]
         aabb = torch.tensor([-bound, -bound, -bound, bound, bound, bound]).cuda()
+
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        background = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
         rendering_result = render(
             viewpoint_camera=view,
             pc=scene.gaussians,
@@ -103,57 +92,56 @@ def render_set(
         gt_image = view.original_image.cuda()
         alpha_mask = view.gt_alpha_mask.cuda()
         gt_image = (gt_image * alpha_mask + background[:, None, None] * (1.0 - alpha_mask)).clamp(0.0, 1.0)
-        depth_map = rendering_result["depth_map"]
+        torchvision.utils.save_image(gt_image, os.path.join(gts_path, f"{idx:05d}.png"))
 
-        depth_img = viridis_cmap(depth_map.squeeze().cpu().numpy())
-        depth_img = (depth_img * 255).astype(np.uint8)
-        normal_map_from_depth = rendering_result["normal_map_from_depth"]
-        normal_map = rendering_result["normal_map"]
-        normal_mask = rendering_result["normal_mask"]
-
-        # normal from point cloud
-        H, W = view.image_height, view.image_width
-        c2w = torch.inverse(view.world_view_transform.T)  # [4, 4]
-        view_dirs = -(
-            (F.normalize(canonical_rays[:, None, :], p=2, dim=-1) * c2w[None, :3, :3])  # [HW, 3, 3]
-            .sum(dim=-1)
-            .reshape(H, W, 3)
-        )  # [H, W, 3]
-
-        if indirect:
-            points = (
-                (-view_dirs.reshape(-1, 3) * depth_map.reshape(-1, 1) + c2w[:3, 3])
-                .clamp(min=-bound, max=bound)
-                .contiguous()
-            )  # [HW, 3]
-            occlusion = recon_occlusion(
-                H=H,
-                W=W,
-                points=points,
-                normals=normal_map.permute(1, 2, 0).reshape(-1, 3).contiguous(),
-                bound=bound,
-                occlusion_coefficients=occlusion_coefficients,
-                occlusion_ids=occlusion_ids,
-                aabb=aabb,
-                degree=occlusion_degree,
-            ).reshape(H, W, 1)
-            irradiance = irradiance_volumes.query_irradiance(
-                points=points.reshape(-1, 3).contiguous(),
-                normals=normal_map.permute(1, 2, 0).reshape(-1, 3).contiguous(),
-            ).reshape(H, W, -1)
+        if not pbr:
+            rendered_image = rendering_result["render"]
+            torchvision.utils.save_image(rendered_image, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         else:
-            occlusion = torch.ones_like(depth_map).permute(1, 2, 0)  # [H, W, 1]
-            irradiance = torch.zeros_like(depth_map).permute(1, 2, 0)  # [H, W, 1]
+            # normal from point cloud
+            canonical_rays = scene.get_canonical_rays()
+            H, W = view.image_height, view.image_width
+            c2w = torch.inverse(view.world_view_transform.T)  # [4, 4]
+            view_dirs = -(
+                (F.normalize(canonical_rays[:, None, :], p=2, dim=-1) * c2w[None, :3, :3])  # [HW, 3, 3]
+                .sum(dim=-1)
+                .reshape(H, W, 3)
+            )  # [H, W, 3]
 
-        torchvision.utils.save_image(
-            (normal_map + 1) / 2, os.path.join(normals_path, f"{idx:05d}_normal.png")
-        )
-        torchvision.utils.save_image(
-            (normal_map_from_depth + 1) / 2,
-            os.path.join(normals_path, f"{idx:05d}_from_depth.png"),
-        )
+            normal_map = rendering_result["normal_map"]
+            depth_map = rendering_result["depth_map"]
+            if indirect and occlusion_volumes is not None:
+                points = (
+                    (-view_dirs.reshape(-1, 3) * depth_map.reshape(-1, 1) + c2w[:3, 3])
+                    .clamp(min=-bound, max=bound)
+                    .contiguous()
+                )  # [HW, 3]
+                occlusion = recon_occlusion(
+                    H=H,
+                    W=W,
+                    points=points,
+                    normals=normal_map.permute(1, 2, 0).reshape(-1, 3).contiguous(),
+                    bound=bound,
+                    occlusion_coefficients=occlusion_coefficients,
+                    occlusion_ids=occlusion_ids,
+                    aabb=aabb,
+                    degree=occlusion_degree,
+                ).reshape(H, W, 1)
+                irradiance = irradiance_volumes.query_irradiance(
+                    points=points.reshape(-1, 3).contiguous(),
+                    normals=normal_map.permute(1, 2, 0).reshape(-1, 3).contiguous(),
+                ).reshape(H, W, -1)
+            else:
+                occlusion = torch.ones_like(depth_map).permute(1, 2, 0)  # [H, W, 1]
+                irradiance = torch.zeros_like(depth_map).permute(1, 2, 0)  # [H, W, 1]
 
-        if pbr:
+            if save_normals:
+                torchvision.utils.save_image(
+                    (normal_map + 1) / 2, os.path.join(normals_path, f"{idx:05d}.png")
+                )
+
+            brdf_lut = get_brdf_lut().cuda()
+            normal_mask = rendering_result["normal_mask"]
             albedo_map = rendering_result["albedo_map"]  # [3, H, W]
             roughness_map = rendering_result["roughness_map"]  # [1, H, W]
             metallic_map = rendering_result["metallic_map"]  # [1, H, W]
@@ -174,32 +162,34 @@ def render_set(
             render_rgb = (
                 pbr_result["render_rgb"].clamp(min=0.0, max=1.0).permute(2, 0, 1)
             )  # [3, H, W]
-            background = torch.zeros_like(render_rgb)
+            background_ = torch.zeros_like(render_rgb) + background[:, None, None]
             render_rgb = torch.where(
                 normal_mask,
                 render_rgb,
-                background,
+                background_,
             )
-            brdf_map = torch.cat(
-                [
-                    albedo_map,
-                    torch.tile(roughness_map, (3, 1, 1)),
-                    torch.tile(metallic_map, (3, 1, 1)),
-                ],
-                dim=2,
-            )  # [3, H, 3W]
-            torchvision.utils.save_image(brdf_map, os.path.join(pbr_path, f"{idx:05d}_brdf.png"))
-            torchvision.utils.save_image(render_rgb, os.path.join(pbr_path, f"{idx:05d}.png"))
+            torchvision.utils.save_image(render_rgb, os.path.join(render_path, f"{idx:05d}.png"))
 
-            psnr_avg += get_psnr(gt_image, render_rgb).mean().double()
-            ssim_avg += get_ssim(gt_image, render_rgb).mean().double()
-            lpips_avg += lpips_fn(gt_image, render_rgb).mean().double()
+            if save_extra:
+                depth_img = viridis_cmap(depth_map.squeeze().cpu().numpy())
+                depth_img = (depth_img * 255).astype(np.uint8)
+                torchvision.utils.save_image(depth_img.permute(2, 0, 1), os.path.join(depths_path, f"{idx:05d}.png"))
 
-    if pbr:
-        psnr = psnr_avg / len(views)
-        ssim = ssim_avg / len(views)
-        lpips = lpips_avg / len(views)
-        print(f"psnr_avg: {psnr}; ssim_avg: {ssim}; lpips_avg: {lpips}")
+                normal_map_from_depth = rendering_result["normal_map_from_depth"]
+                torchvision.utils.save_image(
+                    (normal_map_from_depth + 1) / 2,
+                    os.path.join(normals_from_depth_path, f"{idx:05d}_from_depth.png"),
+                )
+                
+                brdf_map = torch.cat(
+                    [
+                        albedo_map,
+                        torch.tile(roughness_map, (3, 1, 1)),
+                        torch.tile(metallic_map, (3, 1, 1)),
+                    ],
+                    dim=2,
+                )  # [3, H, 3W]
+                torchvision.utils.save_image(brdf_map, os.path.join(pbr_path, f"{idx:05d}_brdf.png"))
 
 
 @torch.no_grad()
@@ -216,6 +206,9 @@ def launch(
     gamma: bool = False,
     indirect: bool = False,
     brdf_eval: bool = False,
+    save_extra: bool = False,
+    save_normals: bool = False,
+    save_envmap: bool = False,
 ) -> None:
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians, shuffle=False)
@@ -237,6 +230,9 @@ def launch(
     model_params = checkpoint["gaussians"]
     cubemap_params = checkpoint["cubemap"]
     irradiance_volumes_params = checkpoint["irradiance_volumes"]
+
+    # checkpoint_path is {model_path}/chkpnt{iteration}.pth
+    iteration = int(os.path.basename(checkpoint_path).replace("chkpnt", "").replace(".pth", ""))
 
     gaussians.restore(model_params)
     cubemap.load_state_dict(cubemap_params)
@@ -260,35 +256,49 @@ def launch(
                 name="test",
             )
     else:
+        bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
+        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
         if not skip_train:
             render_set(
                 model_path=model_path,
                 name="train",
+                iteration=iteration,
+                views=scene.getTrainCameras(),
                 scene=scene,
                 light=cubemap,
                 irradiance_volumes=irradiance_volumes,
                 occlusion_volumes=occlusion_volumes,
                 pipeline=pipeline,
+                background=background,
                 pbr=pbr,
                 metallic=metallic,
                 tone=tone,
                 gamma=gamma,
                 indirect=indirect,
+                save_extra=save_extra,
+                save_normals=save_normals,
+                save_envmap=save_envmap,
             )
         if not skip_test:
             render_set(
                 model_path=model_path,
                 name="test",
+                iteration=iteration,
+                views=scene.getTestCameras(),
                 scene=scene,
                 light=cubemap,
                 irradiance_volumes=irradiance_volumes,
                 occlusion_volumes=occlusion_volumes,
                 pipeline=pipeline,
+                background=background,
                 pbr=pbr,
                 metallic=metallic,
                 tone=tone,
                 gamma=gamma,
                 indirect=indirect,
+                save_extra=save_extra,
+                save_normals=save_normals,
+                save_envmap=save_envmap,
             )
 
 
@@ -369,6 +379,9 @@ if __name__ == "__main__":
     parser.add_argument("--metallic", action="store_true", help="Enable metallic material reconstruction.")
     parser.add_argument("--indirect", action="store_true", help="Enable indirect diffuse modeling.")
     parser.add_argument("--brdf_eval", action="store_true", help="Enable to evaluate reconstructed BRDF.")
+    parser.add_argument("--save_extra", action="store_true", help="Enable to save extra outputs (depth, normal_from_depth, pbr, brdf).")
+    parser.add_argument("--save_normals", action="store_true", help="Enable to save normal maps.")
+    parser.add_argument("--save_envmap", action="store_true", help="Enable to save environment map.")
     args = get_combined_args(parser)
 
     model_path = os.path.dirname(args.checkpoint)
@@ -390,4 +403,7 @@ if __name__ == "__main__":
         gamma=args.gamma,
         indirect=args.indirect,
         brdf_eval=args.brdf_eval,
+        save_extra=args.save_extra,
+        save_normals=args.save_normals,
+        save_envmap=args.save_envmap,
     )
