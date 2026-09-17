@@ -26,19 +26,17 @@ from gaussian_renderer import GaussianModel
 from gs_ir import recon_occlusion, IrradianceVolumes
 
 def render_fps(dataset : ModelParams, checkpoint_path: str, pipeline : PipelineParams, 
-    light: CubemapLight,
     pbr: bool = False,
     metallic: bool = False,
     tone: bool = False,
     gamma: bool = False,
     indirect: bool = False,
-    
     renders_per_view : int = 100
 ) -> None:
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, shuffle=False)
-        cubemap = CubemapLight(base_res=256).cuda()
+        light = CubemapLight(base_res=256).cuda()
         
         # occlusion volumes
         filepath = os.path.join(os.path.dirname(checkpoint_path), "occlusion_volumes.pth")
@@ -65,8 +63,8 @@ def render_fps(dataset : ModelParams, checkpoint_path: str, pipeline : PipelineP
         irradiance_volumes_params = checkpoint["irradiance_volumes"]
         
         gaussians.restore(model_params)
-        cubemap.load_state_dict(cubemap_params)
-        cubemap.eval()
+        light.load_state_dict(cubemap_params)
+        light.eval()
         irradiance_volumes.load_state_dict(irradiance_volumes_params)
         irradiance_volumes.eval()
 
@@ -179,4 +177,4 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_fps(model.extract(args), args.iteration, pipeline.extract(args))
+    render_fps(model.extract(args), args.checkpoint, pipeline.extract(args), args.pbr, args.metallic, args.tone, args.gamma, args.indirect)
