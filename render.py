@@ -58,10 +58,14 @@ def render_set(
         depths_path = os.path.join(model_path, name, f"ours_{iteration}", "depth")
         pbr_path = os.path.join(model_path, name, f"ours_{iteration}", "pbr")
         pc_path = os.path.join(model_path, name, f"ours_{iteration}", "pc")
+        occl_path = os.path.join(model_path, name, f"ours_{iteration}", "occl")
+        indir_path = os.path.join(model_path, name, f"ours_{iteration}", "indir")
         os.makedirs(normals_from_depth_path, exist_ok=True)
         os.makedirs(depths_path, exist_ok=True)
         os.makedirs(pbr_path, exist_ok=True)
         os.makedirs(pc_path, exist_ok=True)
+        os.makedirs(occl_path, exist_ok=True)
+        os.makedirs(indir_path, exist_ok=True)
 
     if save_envmap:
         # build mip for environment light
@@ -173,7 +177,18 @@ def render_set(
             if save_extra:
                 depth_img = viridis_cmap(depth_map.squeeze().cpu().numpy())
                 depth_img = (depth_img * 255).astype(np.uint8)
-                torchvision.utils.save_image(depth_img.permute(2, 0, 1), os.path.join(depths_path, f"{idx:05d}.png"))
+                imageio.imwrite(
+                    os.path.join(depths_path, f"{idx:05d}_depth.png"),
+                    depth_img
+                )
+                
+                indirect_light = (1 - occlusion) * irradiance
+                torchvision.utils.save_image(
+                    occlusion.permute(2, 0, 1), os.path.join(occl_path, f"{idx:05d}_occl.png")
+                )
+                torchvision.utils.save_image(
+                    indirect_light.permute(2, 0, 1), os.path.join(indir_path, f"{idx:05d}_indir.png")
+                )
 
                 normal_map_from_depth = rendering_result["normal_map_from_depth"]
                 torchvision.utils.save_image(
