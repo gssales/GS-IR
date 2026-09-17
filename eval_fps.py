@@ -37,6 +37,7 @@ def render_fps(dataset : ModelParams, checkpoint_path: str, pipeline : PipelineP
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, shuffle=False)
         light = CubemapLight(base_res=256).cuda()
+        light.build_mips()
         
         # occlusion volumes
         filepath = os.path.join(os.path.dirname(checkpoint_path), "occlusion_volumes.pth")
