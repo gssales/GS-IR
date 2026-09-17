@@ -40,7 +40,6 @@ def evaluate(model_paths):
     full_dict_polytopeonly = {}
     per_view_dict_polytopeonly = {}
     print("")
-    lpips_fn = LPIPS(net="vgg").cuda()
 
     for scene_dir in model_paths:
         # try:
